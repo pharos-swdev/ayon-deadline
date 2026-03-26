@@ -206,10 +206,19 @@ class HoudiniSubmitDeadline(
         if is_in_tests():
             job_info.BatchName += datetime.now().strftime("%d%m%Y%H%M%S")
 
-        # Override job name for convenience
-        instance_name_id = instance.data.get("instance_id", instance.name)
+        # Override job name and store for its dependend publish job naming
+        # and include the folder path for multishot workflow name clarity
+        product_name = instance.data.get("productName")
         project_code = context.data.get("projectEntity").get("code")
-        job_info.Name = f"[{project_code}] {filename} - {instance_name_id} {job_type}"
+        dl_job_instance_name = (
+            f"{product_name} ({instance.data.get('folderPath')})"
+        )
+        dl_job_name = (
+            f"[{project_code}] {filename} - "
+            f"{dl_job_instance_name} {job_type}"
+        )
+        job_info.Name = dl_job_name
+        instance.data["dl_job_instance_name"] = dl_job_instance_name
         job_info.BatchName = f"[{project_code}] {job_info.BatchName}"
 
         # already collected explicit values for rendered Frames

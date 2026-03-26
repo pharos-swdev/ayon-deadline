@@ -162,12 +162,16 @@ class NukeSubmitDeadline(
         render_path = instance.data["path"]
         job_info.Name = os.path.basename(render_path)
 
-        # Override job name for convenience
+        # Override job name to match general naming convention
+        job_type = "[RENDER]"
         context = instance.context
         filepath = context.data["currentFile"]
         filename = os.path.basename(filepath)
+        product_name = instance.data("productName")
         project_code = context.data.get("projectEntity").get("code")
-        job_info.Name = f"[{project_code}] {filename} - {instance.name}"
+        job_info.Name = (
+            f"[{project_code}] {filename} - {product_name} {job_type}"
+        )
 
         return job_info
 

@@ -162,9 +162,12 @@ class ProcessSubmittedJobOnFarm(pyblish.api.InstancePlugin,
         product_name = data["productName"]
         job_name = "Publish - {}".format(product_name)
 
-        # Override job name for convenience
+        # Override job name to match general naming convention
         batch_name = self._get_batch_name(instance, render_job)
-        instance_name_id = instance.data.get("instance_id") or instance.data['productName'] or instance.name
+        instance_name_id = (
+            instance.data.get("dl_job_instance_name")
+            or instance.data.get("instance_node")
+            or product_name)
         job_name = f"{batch_name} - {instance_name_id} [PUBLISH]"
 
         context = instance.context
