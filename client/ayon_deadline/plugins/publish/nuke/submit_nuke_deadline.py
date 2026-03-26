@@ -146,7 +146,7 @@ class NukeSubmitDeadline(
     def get_job_info(self, job_info=None, **kwargs):
         instance = self._instance
 
-        job_info.Plugin = "Nuke"
+        job_info.Plugin = "Nuke14"
 
         start_frame = int(instance.data["frameStartHandle"])
         end_frame = int(instance.data["frameEndHandle"])
@@ -161,6 +161,13 @@ class NukeSubmitDeadline(
 
         render_path = instance.data["path"]
         job_info.Name = os.path.basename(render_path)
+
+        # Override job name for convenience
+        context = instance.context
+        filepath = context.data["currentFile"]
+        filename = os.path.basename(filepath)
+        project_code = context.data.get("projectEntity").get("code")
+        job_info.Name = f"[{project_code}] {filename} - {instance.name}"
 
         return job_info
 
