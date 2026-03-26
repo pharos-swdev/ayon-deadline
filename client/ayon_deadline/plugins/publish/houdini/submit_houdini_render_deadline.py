@@ -206,6 +206,12 @@ class HoudiniSubmitDeadline(
         if is_in_tests():
             job_info.BatchName += datetime.now().strftime("%d%m%Y%H%M%S")
 
+        # Override job name for convenience
+        instance_name_id = instance.data.get("instance_id", instance.name)
+        project_code = context.data.get("projectEntity").get("code")
+        job_info.Name = f"[{project_code}] {filename} - {instance_name_id} {job_type}"
+        job_info.BatchName = f"[{project_code}] {job_info.BatchName}"
+
         # already collected explicit values for rendered Frames
         if not job_info.Frames:
             # Deadline requires integers in frame range
@@ -390,4 +396,7 @@ class HoudiniSubmitDeadlineUsdRender(HoudiniSubmitDeadline):
         # Do not use published workfile paths for USD Render ROP because the
         # Export Job doesn't seem to occur using the published path either, so
         # output paths then do not match the actual rendered paths
+
+        # Set custom instance data so we can bypass the fallback warning.
+        self._instance.data["use_workfile_for_render"] = "True"
         return

@@ -245,6 +245,10 @@ class AbstractSubmitDeadline(
         if is_in_tests():
             batch_name += datetime.now().strftime("%d%m%Y%H%M%S")
 
+        # Override job name for convenience
+        project_code = context.data.get("projectEntity").get("code")
+        batch_name = f"[{project_code}] {batch_name}"
+
         job_info.Name = "%s - %s" % (batch_name, instance.name)
         job_info.BatchName = batch_name
         # TODO clean deadlineUser
