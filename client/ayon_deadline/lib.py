@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from contextlib import suppress
 from dataclasses import dataclass, field, fields
 from functools import partial
 import typing
@@ -32,12 +35,26 @@ FARM_FAMILIES = [
 JOB_ENV_DATA_KEY: str = "farmJobEnv"
 
 
-@dataclass
+MAX_CHUNK_SIZE = 2147483647
+"""Maximum chunk size for Deadline."""
+
+
+@dataclass(frozen=True)
 class DeadlineConnectionInfo:
-    """Connection information for Deadline server."""
+    """Connection information for Deadline server.
+
+    Frozen to be hashable, so it can be used as cache key.
+
+    Attributes:
+        name: Deadline server name from settings.
+        url: Deadline webservice url.
+        auth: Username and password, 'None' when authentication
+            is not used.
+        verify: Verify SSL certificate of the webservice.
+    """
     name: str
     url: str
-    auth: Tuple[str, str]
+    auth: tuple[str, str] | None
     verify: bool
 
 
@@ -328,6 +345,10 @@ class DeadlineIndexedVar(dict):
         return self
 
     def __setitem__(self, key, value):
+        if isinstance(key, str):
+            with suppress(ValueError):
+                key = int(key)
+
         if not isinstance(key, int):
             raise TypeError(f"Key must be an 'int', got {type(key)} ({key}).")
 
@@ -373,12 +394,12 @@ class DeadlineJobInfo:
     SecondaryPool: Optional[str] = field(default=None)
     # Default: "none"
     Group: Optional[str] = field(default=None)
-    Priority: int = field(default=None)
-    ChunkSize: int = field(default=None)
-    ConcurrentTasks: int = field(default=None)
+    Priority: int | None = field(default=None)
+    ChunkSize: int | None = field(default=None)
+    ConcurrentTasks: int | None = field(default=None)
     # Default: "true"
     LimitConcurrentTasksToNumberOfCpus: Optional[bool] = field(default=None)
-    OnJobComplete: str = field(default=None)
+    OnJobComplete: str | None = field(default=None)
     # Default: false
     SynchronizeAllAuxiliaryFiles: Optional[bool] = field(default=None)
     # Default: false
@@ -607,6 +628,10 @@ class DeadlineJobInfo:
                 setattr(self, attr_name, value)
 
     def __setattr__(self, key, value):
+        # ChunkSize=0 means "unlimited" - convert to max chunk size
+        if key == "ChunkSize" and value == 0:
+            value = MAX_CHUNK_SIZE
+
         if value is None:
             super().__setattr__(key, value)
             return
@@ -690,6 +715,7 @@ class PublishDeadlineJobInfo(DeadlineJobInfo):
             "MachineLimit": data["machine_limit"],
             "ConcurrentTasks": data["concurrent_tasks"],
             "Frames": data.get("frames", ""),
+            "Department": cls._sanitize(data.get("department") or None),
             "Group": cls._sanitize(data["group"]),
             "LimitGroups": cls._sanitize(data["limit_groups"]),
             "Pool": cls._sanitize(data["primary_pool"]),

@@ -223,10 +223,15 @@ class ProcessSubmittedJobOnFarm(pyblish.api.InstancePlugin,
         )
 
         job_info = instance.data["deadline"]["job_info"]
+        deadline_department = (
+            job_info.Department
+            or self.deadline_department
+            or None
+        )
         job_info = DeadlineJobInfo(
             Name=job_name,
             BatchName=batch_name,
-            Department=self.deadline_department,
+            Department=deadline_department,
             Priority=priority,
             InitialStatus=job_info.publish_job_state,
             Group=self.deadline_group,
@@ -258,6 +263,14 @@ class ProcessSubmittedJobOnFarm(pyblish.api.InstancePlugin,
             batch_name = os.path.splitext(os.path.basename(
                 instance.context.data["currentFile"]
             ))[0]
+
+        # Ensure batch name starts with project code prefix
+        context = instance.context
+        project_code = context.data.get("projectEntity").get("code")
+        batch_prefix = f"[{project_code}]"
+        if not batch_name.startswith(batch_prefix):
+            batch_name = f"{batch_prefix} {batch_name}"
+
         return batch_name
 
     def _get_username(self, instance, render_job):
