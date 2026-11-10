@@ -1,14 +1,19 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
+import io
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 import subprocess
 import json
 import platform
+import random
+import shutil
+import socket
+import marshal
 import uuid
 import re
-from time import sleep
+from time import sleep, time
 import getpass
 from hashlib import sha256
 
@@ -19,7 +24,7 @@ from Deadline.Scripting import (
 )
 
 
-__version__ = "1.2.5"
+__version__ = "1.3.1"
 VERSION_REGEX = re.compile(
     r"(?P<major>0|[1-9]\d*)"
     r"\.(?P<minor>0|[1-9]\d*)"
@@ -27,10 +32,26 @@ VERSION_REGEX = re.compile(
     r"(?:-(?P<prerelease>[a-zA-Z\d\-.]*))?"
     r"(?:\+(?P<buildmetadata>[a-zA-Z\d\-.]*))?"
 )
-EXTRACT_ENVIRONMENT_TIMEOUT = 30
+# Maximum seconds a worker waits for another worker to extract the environment
+# cache before it stops waiting and extracts the environment just for itself.
+# Waiting workers continue as soon as the cache file appears, so this only
+# matters when the extraction is slow. Fresh render nodes download addons as
+# part of the extraction which easily takes longer than a few seconds, and
+# each worker that gives up queries the AYON server on its own.
+EXTRACT_ENVIRONMENT_TIMEOUT = 60
+# Seconds between checks while waiting for another worker. Checks only touch
+# the file system, not the AYON server.
+ENV_CACHE_POLL_INTERVAL = 0.5
+# Age at which an extraction lock file is considered left behind by a worker
+# that will never come back, e.g. because its machine lost power.
+ENV_CACHE_LOCK_STALE_TIMEOUT = 300
+# Results of '_acquire_env_cache_lock'.
+_LOCK_ACQUIRED = "acquired"
+_LOCK_CACHE_READY = "cache_ready"
+_LOCK_UNAVAILABLE = "unavailable"
 
 
-class OpenPypeVersion(object):
+class OpenPypeVersion:
     """Fake semver version class for OpenPype version purposes.
 
     The version
@@ -395,7 +416,9 @@ def inject_openpype_environment(deadlinePlugin):
         if "PATH" in contents:
             # Set os.environ[PATH] so studio settings' path entries
             # can be used to define search path for executables.
-            print(">>> Setting 'PATH' Environment to: {}".format(contents['PATH']))
+            print(">>> Setting 'PATH' Environment to: {}".format(
+                contents['PATH'])
+            )
             os.environ["PATH"] = contents["PATH"]
 
         script_url = job.GetJobPluginInfoKeyValue("ScriptFilename")
@@ -453,75 +476,58 @@ def inject_ayon_environment(deadlinePlugin):
 
         ayon_server_url, ayon_api_key = handle_credentials(job)
 
+        # [PHAROS] Only Start: Set Api Key
         # Remove when Deadline Remote Connection Server is set up!
         api_key_path = "//blackhole/media/vfx/libs/ayonlib/deadline/api.txt"
         if os.path.isfile(api_key_path):
             with open(api_key_path, "r") as file:
                 ayon_api_key = file.readline().strip()
-        # --------------------------------------------------------
+        # [PHAROS] Only End
 
         site_id = os.environ.get("AYON_SITE_ID")
         shared_env_group = None
         if site_id:
             hash_base = "{}|{}".format(site_id, getpass.getuser())
+            # jobs with host specific environment (e.g. Perforce workspace
+            # of the render node) can share the cache only on the same host
+            if job.GetJobEnvironmentKeyValue("AYON_ENV_CACHE_PER_HOST"):
+                hash_base = "{}|{}".format(hash_base, socket.gethostname())
             hash_sha256 = sha256(hash_base.encode('utf-8'))
             shared_env_group = hash_sha256.hexdigest()[-10:]
+
+        def extract_to(target_path):
+            """Run the extraction process writing into 'target_path'."""
+            _extract_environments(
+                ayon_server_url,
+                ayon_api_key,
+                ayon_studio_bundle_name,
+                ayon_bundle_name,
+                deadlinePlugin,
+                exe,
+                target_path,
+                job
+            )
+
+        contents = None
         # drive caching of environment variables with env var
         # it is recommended to use same value AYON_SITE_ID for 'same'
         # render nodes (eg. same OS etc.)
         if shared_env_group:
             print(">>> Caching of environment file will be used.")
-            output_dir = _get_output_dir(job)
-            environment_file_name = "env_{}_{}.json".format(job.JobId, shared_env_group)
-            export_dir_url = os.path.join(
-                output_dir,
-                ".ayon_env_cache"
-            )
-
-            if not os.path.exists(export_dir_url):
-                os.makedirs(export_dir_url, exist_ok=True)
-
-            export_path = os.path.join(
-                export_dir_url,
-                environment_file_name)
-            _wait_for_in_progress(job, export_path)
-        else:
-            # no caching - default behavior
-            temp_file_name = "{}_{}.json".format(
-                datetime.utcnow().strftime("%Y%m%d%H%M%S%f"),
-                str(uuid.uuid1())
-            )
-            export_path = os.path.join(tempfile.gettempdir(), temp_file_name)
-
-        if not os.path.exists(export_path):
-            print(">>> '{}' with extracted environment doesn't exist yet, running extraction process...".format(export_path))
-            temp_export_path = "{}.tmp".format(export_path)
-            with open(temp_export_path, "w"):
-                pass
-            try:
-                _extract_environments(
-                    ayon_server_url,
-                    ayon_api_key,
-                    ayon_studio_bundle_name,
-                    ayon_bundle_name,
-                    deadlinePlugin,
-                    exe,
-                    temp_export_path,
-                    job
+            export_path = _get_env_cache_path(job, shared_env_group)
+            if export_path:
+                contents = _get_shared_environments(
+                    export_path,
+                    _get_env_cache_timeout(job),
+                    extract_to
                 )
-                if (not os.path.exists(export_path) and
-                        os.path.exists(temp_export_path)):
-                    print("Creating env var file {}".format(export_path))
-                    os.rename(temp_export_path, export_path)
-            except Exception as e:
-                print("ERROR: Could not extract environment: {}".format(e))
-            finally:
-                if os.path.exists(temp_export_path):
-                    os.remove(temp_export_path)
 
-        print(">>> Loading file '{}' ...".format(export_path))
-        with open(export_path) as fp:
-            contents = json.load(fp)
+        if contents is None:
+            # Either caching is disabled or the shared cache could not be
+            # used, e.g. because another worker is still busy with it. That
+            # must never fail the job, so extract into a file private to
+            # this worker instead.
+            contents = _extract_private_environments(extract_to)
 
         for key, value in sorted(contents.items()):
             deadlinePlugin.SetProcessEnvironmentVariable(key, value)
@@ -529,8 +535,17 @@ def inject_ayon_environment(deadlinePlugin):
         if "PATH" in contents:
             # Set os.environ[PATH] so studio settings' path entries
             # can be used to define search path for executables.
-            print(">>> Setting 'PATH' Environment to: {}".format(contents['PATH']))
+            print(">>> Setting 'PATH' Environment to: {}".format(
+                contents['PATH'])
+            )
             os.environ["PATH"] = contents["PATH"]
+
+        # job id is not known at submission, e.g. Unreal remote rendering
+        # reports the job result with it
+        deadlinePlugin.SetProcessEnvironmentVariable(
+            "AYON_DEADLINE_JOBID", job.JobId)
+
+        _sync_perforce_workspace(deadlinePlugin, job, contents)
 
         script_url = job.GetJobPluginInfoKeyValue("ScriptFilename")
         if script_url:
@@ -548,40 +563,446 @@ def inject_ayon_environment(deadlinePlugin):
         raise
 
 
-def _wait_for_in_progress(job, export_path):
-    """Check if another worker started extractenvironments already.
+def _sync_perforce_workspace(deadlinePlugin, job, contents):
+    """Sync Perforce workspace of the render node to the job changelist.
 
-    extractenvironments might be expensive operation, so first worker who
-    starts doing it creates empty file before it. All other workers should
-    wait until this file gets renamed to final name.
-    Raises:
-        (RuntimeError) if extraction takes more
-            than EXTRACT_ENVIRONMENT_TIMEOUT seconds
+    AYON Perforce launch hook syncs the workspace during extraction of
+    environments, which can be cached. Another job may sync the workspace
+    to a different changelist in the meantime, so the sync runs for every
+    task. It is a no-op if the workspace is already synced.
+
+    Runs only for jobs submitted with Perforce data ('AYON_P4_CHANGELIST'
+    set by ayon-perforce publish) when the render node workspace is known
+    ('AYON_P4_WORKSPACE' set by ayon-perforce launch hook) and 'p4' is
+    available. Other jobs are not affected.
     """
-    export_in_progress_path = "{}.tmp".format(export_path)
-    timeout = int(
-        job.GetJobEnvironmentKeyValue("AYON_EXTRACT_ENVIRONMENT_TIMEOUT")
-        or EXTRACT_ENVIRONMENT_TIMEOUT
-    )
-    while os.path.exists(export_in_progress_path):
-        file_modified  = datetime.fromtimestamp(
-            os.path.getmtime(export_in_progress_path)
+    changelist = job.GetJobEnvironmentKeyValue("AYON_P4_CHANGELIST")
+    workspace = contents.get("AYON_P4_WORKSPACE")
+    if not changelist or not workspace:
+        return
+
+    env = os.environ.copy()
+    env.update(contents)
+    p4_executable = shutil.which("p4", path=env.get("PATH"))
+    if not p4_executable:
+        print(
+            "!!! Perforce job but 'p4' executable was not found, skipping "
+            "sync of Perforce workspace."
         )
-        date_diff = datetime.now() - file_modified
-        if date_diff > timedelta(seconds=timeout):
-            print(
-                "Previous extract environment process stuck for "
-                "'{}' sec. Starting it from scratch.".format(timeout)
+        return
+
+    filespec = "//{}/...@{}".format(workspace, changelist)
+    args = [p4_executable, "-G", "-c", workspace, "sync", filespec]
+    print(">>> Syncing Perforce workspace: {}".format(
+        subprocess.list2cmdline(args))
+    )
+    proc = subprocess.run(args, capture_output=True, env=env, check=False)
+
+    errors = []
+    synced = 0
+    stream = io.BytesIO(proc.stdout)
+    while True:
+        try:
+            record = marshal.load(stream)
+        except EOFError:
+            break
+        record = {
+            (k.decode() if isinstance(k, bytes) else k):
+            (v.decode(errors="replace") if isinstance(v, bytes) else v)
+            for k, v in record.items()
+        }
+        if record.get("code") != "error":
+            synced += 1
+            continue
+        message = str(record.get("data", "")).strip()
+        # warnings like "file(s) up-to-date." are fine
+        if int(record.get("severity", 0)) > 2:
+            errors.append(message)
+        else:
+            pass
+            print(">>> {}".format(message))
+
+    if errors or (proc.returncode != 0 and not proc.stdout):
+        stderr = proc.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            "Perforce sync failed: {}".format("; ".join(errors) or stderr)
+        )
+    print(">>> Perforce sync finished, {} file(s) updated.".format(synced))
+
+
+def _get_env_cache_timeout(job):
+    """How long a worker waits for the environment extraction of another one.
+
+    Returns:
+        int: Wait time in seconds, overridable per job with the
+            'AYON_EXTRACT_ENVIRONMENT_TIMEOUT' environment variable.
+    """
+    value = job.GetJobEnvironmentKeyValue("AYON_EXTRACT_ENVIRONMENT_TIMEOUT")
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = EXTRACT_ENVIRONMENT_TIMEOUT
+    return max(timeout, 0)
+
+
+def _get_env_cache_path(job, shared_env_group):
+    """Path of the environment cache file shared by the workers of a job.
+
+    Args:
+        job: Deadline job.
+        shared_env_group (str): Hash of the site id and user, so that only
+            workers with a matching environment share a cache file.
+
+    Returns:
+        Optional[str]: Path of the shared JSON cache file. 'None' when its
+            location can't be determined or created, in which case the caller
+            falls back to a worker private environment file.
+    """
+    try:
+        export_dir_url = os.path.join(_get_output_dir(job), ".ayon_env_cache")
+        # 'exist_ok' keeps this safe when many workers start at once
+        os.makedirs(export_dir_url, exist_ok=True)
+    except (OSError, RuntimeError) as exc:
+        print(">>> Unable to prepare environment cache folder: {}".format(exc))
+        return None
+
+    return os.path.join(
+        export_dir_url, "env_{}_{}.json".format(job.JobId, shared_env_group)
+    )
+
+
+def _get_shared_environments(export_path, timeout, extract_to):
+    """Get environments through the cache file shared by the job's workers.
+
+    Only a single worker runs the expensive extraction process, all others
+    wait for its result. Problems with the shared cache itself - a lock that
+    can't be taken, a worker that takes too long, an unreadable file - return
+    'None' instead of raising, so the caller can fall back to a private
+    extraction. A failure of the extraction process itself is raised.
+
+    Args:
+        export_path (str): Path to the shared cache file.
+        timeout (int): Seconds to wait for another worker before giving up.
+        extract_to (Callable[[str], None]): Runs the extraction process into
+            the path it receives.
+
+    Returns:
+        Optional[dict[str, str]]: Extracted environment variables.
+    """
+    status, token = _acquire_env_cache_lock(export_path, timeout)
+    if status == _LOCK_ACQUIRED:
+        try:
+            # Re-check: another worker may have completed the extraction
+            # between our last check and acquiring the lock.
+            if os.path.exists(export_path):
+                print(">>> Environment cache appeared while taking the lock.")
+            else:
+                return _extract_to_env_cache(export_path, extract_to)
+        finally:
+            _release_env_cache_lock(export_path, token)
+
+    return _read_env_cache(export_path)
+
+
+def _extract_to_env_cache(export_path, extract_to):
+    """Run the extraction and publish its result as the shared cache file.
+
+    Extraction writes to a path unique for this worker, so even a second
+    worker that reclaimed an abandoned lock can't write into the same file.
+    Only the final atomic replace makes the result visible to others.
+
+    Args:
+        export_path (str): Path to the shared cache file.
+        extract_to (Callable[[str], None]): Runs the extraction process into
+            the path it receives.
+
+    Returns:
+        dict[str, str]: Extracted environment variables, read back from the
+            file this worker extracted. Publishing it for the other workers
+            is best effort and never fails this worker.
+    """
+    temp_export_path = "{}.{}.tmp".format(export_path, _get_worker_id())
+    try:
+        print(
+            ">>> '{}' with extracted environment doesn't exist"
+            " yet, running extraction process...".format(export_path)
+        )
+        extract_to(temp_export_path)
+        if not os.path.exists(temp_export_path):
+            raise RuntimeError(
+                "Extraction process did not create expected file"
+                " '{}'.".format(temp_export_path)
             )
+        contents = _load_environments(temp_export_path)
+
+        print(">>> Creating env var file {}".format(export_path))
+        try:
+            # atomic for readers, they see either no file or the full one
+            os.replace(temp_export_path, export_path)
+        except OSError as exc:
+            # e.g. Windows refuses to replace a file another worker reads
+            print(">>> Could not publish environment cache file: {}".format(
+                exc)
+            )
+        return contents
+    finally:
+        _remove_silently(temp_export_path)
+
+
+def _read_env_cache(export_path):
+    """Read the shared cache file extracted by another worker.
+
+    Args:
+        export_path (str): Path to the shared cache file.
+
+    Returns:
+        Optional[dict[str, str]]: Environment variables or 'None' when the
+            file is missing or unusable, so that the caller falls back to a
+            private extraction instead of failing the job.
+    """
+    if not os.path.exists(export_path):
+        return None
+
+    print(">>> Loading file '{}' ...".format(export_path))
+    try:
+        return _load_environments(export_path)
+    except (OSError, ValueError) as exc:
+        print(">>> Unable to use environment cache '{}': {}".format(
+            export_path, exc)
+        )
+        return None
+
+
+def _extract_private_environments(extract_to):
+    """Extract environments into a file used by this worker only.
+
+    Args:
+        extract_to (Callable[[str], None]): Runs the extraction process into
+            the path it receives.
+
+    Returns:
+        dict[str, str]: Extracted environment variables.
+    """
+    temp_file_name = "ayon_env_{}_{}.json".format(
+        datetime.utcnow().strftime("%Y%m%d%H%M%S%f"),
+        uuid.uuid4().hex
+    )
+    export_path = os.path.join(tempfile.gettempdir(), temp_file_name)
+    try:
+        print(
+            ">>> Running extraction process for this worker only into"
+            " '{}'...".format(export_path)
+        )
+        extract_to(export_path)
+        if not os.path.exists(export_path):
+            raise RuntimeError(
+                "Extraction process did not create expected file"
+                " '{}'.".format(export_path)
+            )
+        return _load_environments(export_path)
+    finally:
+        _remove_silently(export_path)
+
+
+def _acquire_env_cache_lock(export_path, timeout):
+    """Try to become the single worker that extracts the environments.
+
+    Uses 'os.open' with 'O_CREAT | O_EXCL' which is atomic on local
+    filesystems and on the NFS v4+ / SMB shares used by render farms, so only
+    one worker of a job can create the lock file, all others wait for it.
+
+    Waiting is never fatal and ends as soon as the cache file appears. A
+    worker that doesn't get the lock in time extracts the environment for
+    itself instead of failing the job, which keeps a burst of workers starting
+    at the same time functional even when the lock owner is slow or died on
+    the way. The moment of giving up is spread randomly, so such workers don't
+    all query the AYON server in the same second.
+
+    A lock file older than 'ENV_CACHE_LOCK_STALE_TIMEOUT' seconds is treated
+    as abandoned - a machine can lose power while holding it - and removed,
+    so a job is not stuck behind it for the rest of its lifetime.
+
+    Args:
+        export_path (str): Path to the shared environment cache file. The
+            lock file is 'export_path' with a '.lock' suffix.
+        timeout (int): Seconds to wait for the current lock owner.
+
+    Returns:
+        tuple[str, Optional[str]]: Status and, when acquired, the token
+            identifying our ownership of the lock file:
+            - '_LOCK_ACQUIRED': run the extraction, then release the lock.
+            - '_LOCK_CACHE_READY': the cache file is there, just read it.
+            - '_LOCK_UNAVAILABLE': neither happened in time, extract into a
+              worker private file instead.
+    """
+    lock_path = "{}.lock".format(export_path)
+    token = _get_worker_id()
+    give_up_at = time() + timeout * random.uniform(1.0, 1.25)
+    waiting_logged = False
+
+    while True:
+        # Short-circuit, the final file appeared - nothing to extract.
+        if os.path.exists(export_path):
+            return _LOCK_CACHE_READY, None
+
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            pass  # another worker holds the lock, fall through to wait
+        except OSError as exc:
+            # locking is not possible at all, e.g. on a read only share
+            print(">>> Cannot use environment cache lock: {}".format(exc))
+            return _LOCK_UNAVAILABLE, None
+        else:
             try:
-                os.remove(export_in_progress_path)
-                break
-            except (OSError, PermissionError):
-                raise RuntimeError(
-                    "Failed to remove progress file '{}'".format(export_in_progress_path)
+                # 'fdopen' takes ownership of the descriptor and closes it,
+                # also when writing the token fails
+                with os.fdopen(fd, "w") as stream:
+                    stream.write(token)
+            except OSError as exc:
+                # e.g. the share ran out of space or quota. Leaving the
+                # lock file behind would block every other worker of this
+                # job until it ages out, and there is no reason to fail
+                # over it - extract into a private file instead.
+                print(">>> Cannot write environment cache lock: {}".format(
+                    exc)
                 )
-        print("Extract environment process already triggered, waiting")
-        sleep(2)
+                _remove_silently(lock_path)
+                return _LOCK_UNAVAILABLE, None
+            print(">>> Acquired extraction lock: {}".format(lock_path))
+            return _LOCK_ACQUIRED, token
+
+        if _remove_abandoned_lock(lock_path):
+            continue  # retry acquisition immediately
+
+        if time() >= give_up_at:
+            print(
+                ">>> Another worker did not finish extracting the"
+                " environment within {}s, extracting for this worker"
+                " instead.".format(timeout)
+            )
+            return _LOCK_UNAVAILABLE, None
+
+        if not waiting_logged:
+            print(
+                ">>> Another worker is extracting the environment cache"
+                " file, waiting up to {}s for: {}".format(timeout, export_path)
+            )
+            waiting_logged = True
+
+        sleep(ENV_CACHE_POLL_INTERVAL)
+
+
+def _remove_abandoned_lock(lock_path):
+    """Remove a lock file left behind by a worker that never came back.
+
+    The threshold is much larger than the time any extraction should take,
+    because the lock file's timestamp comes from the file server while the
+    current time comes from the render node, and those two only agree as well
+    as the farm's clock synchronization allows.
+
+    Args:
+        lock_path (str): Path to the lock file.
+
+    Returns:
+        bool: Whether an abandoned lock file was removed.
+    """
+    try:
+        lock_age = time() - os.path.getmtime(lock_path)
+    except OSError:
+        return False  # lock disappeared, the caller retries anyway
+
+    if lock_age < ENV_CACHE_LOCK_STALE_TIMEOUT:
+        return False
+
+    print(
+        ">>> Lock '{}' looks abandoned ({:.0f}s old),"
+        " removing it.".format(lock_path, lock_age)
+    )
+    try:
+        os.remove(lock_path)
+    except OSError:
+        return False  # another worker removed it first
+    return True
+
+
+def _release_env_cache_lock(export_path, token):
+    """Release the extraction lock, but only while it is still ours.
+
+    A lock considered abandoned may have been reclaimed by another worker
+    while we were extracting. Removing that worker's lock would let a third
+    one start extracting in parallel, so the token written when acquiring the
+    lock is verified first.
+
+    Args:
+        export_path (str): Path to the shared environment cache file.
+        token (str): Token returned by '_acquire_env_cache_lock'.
+    """
+    lock_path = "{}.lock".format(export_path)
+    try:
+        with open(lock_path) as stream:
+            current_token = stream.read().strip()
+    except OSError:
+        return  # already removed by somebody else
+
+    if current_token and current_token != token:
+        print(
+            ">>> Extraction lock '{}' was taken over by another"
+            " worker, leaving it alone.".format(lock_path)
+        )
+        return
+
+    try:
+        os.remove(lock_path)
+        print(">>> Released extraction lock: {}".format(lock_path))
+    except OSError:
+        pass
+
+
+def _load_environments(path):
+    """Read extracted environment variables from a JSON file.
+
+    Args:
+        path (str): Path to the JSON file.
+
+    Returns:
+        dict[str, str]: Environment variables.
+
+    Raises:
+        ValueError: If the file is not valid JSON or does not hold a mapping,
+            e.g. because it was written by an older, non atomic version of
+            this plugin and got truncated.
+    """
+    with open(path) as stream:
+        contents = json.load(stream)
+
+    if not isinstance(contents, dict):
+        raise ValueError(
+            "File '{}' does not contain environment variables.".format(path)
+        )
+    return contents
+
+
+def _remove_silently(path):
+    """Remove a file if it exists, ignoring any failure to do so."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _get_worker_id():
+    """Identifier unique for a single extraction attempt on this worker.
+
+    Returns:
+        str: Filename safe identifier, used both for the temporary file the
+            extraction writes to and as the lock file's ownership token.
+    """
+    return "{}_{}_{}".format(
+        re.sub(r"\W", "", platform.node()),
+        os.getpid(),
+        uuid.uuid4().hex[:8]
+    )
 
 
 def _get_output_dir(job):
@@ -650,12 +1071,29 @@ def _extract_environments(
         "AYON_API_KEY": ayon_api_key,
         "AYON_STUDIO_BUNDLE_NAME": ayon_studio_bundle_name,
         "AYON_BUNDLE_NAME": ayon_bundle_name,
-        "AYON_LAUNCHER_STORAGE_DIR": "//blackhole/media/vfx/libs/ayonlib/_distro",
-        "PHAROS_HOUDINILIB": "//blackhole/media/vfx/libs/houdinilib",
-        "PHAROS_HOUDINI": "//blackhole/media/vfx/libs/pharos_houdini",
     }
 
-    for key in ("AYON_USE_STAGING", "AYON_IN_TESTS"):
+    # [PHAROS] Only Start: Set custom env
+    # This can be removed once Ayon supports fallback values
+    # for bundle variables
+    env_pharos_houdini = job.GetJobEnvironmentKeyValue("PHAROS_HOUDINI") or "//blackhole/media/vfx/libs/pharos_houdini"  # noqa: E501
+    env_pharos_nuke = job.GetJobEnvironmentKeyValue("PHAROS_NUKE") or "//blackhole/media/vfx/libs/pharos_nuke"  # noqa: E501
+    env_pharos_vfxbase = job.GetJobEnvironmentKeyValue("PHAROS_VFX_BASE") or "//blackhole/media/vfx/libs/pharos_vfx_base"  # noqa: E501
+
+    environment.update ({
+        "PHAROS_HOUDINI": env_pharos_houdini,
+        "PHAROS_NUKE": env_pharos_nuke,
+        "PHAROS_VFX_BASE": env_pharos_vfxbase,
+    })
+    # [PHAROS] Only End
+
+    for key in (
+        "AYON_USE_STAGING",
+        "AYON_IN_TESTS",
+        # used by AYON Perforce launch hook to sync the render workspace
+        "AYON_P4_STREAM",
+        "AYON_P4_CHANGELIST",
+    ):
         value = job.GetJobEnvironmentKeyValue(key)
         if value:
             environment[key] = value
@@ -848,6 +1286,12 @@ def __main__(deadlinePlugin):
     ayon_render_job = job.GetJobEnvironmentKeyValue("AYON_RENDER_JOB")
     ayon_publish_job = job.GetJobEnvironmentKeyValue("AYON_PUBLISH_JOB")
     ayon_remote_job = job.GetJobEnvironmentKeyValue("AYON_REMOTE_PUBLISH")
+    ayon_has_bundle_envkey = job.GetJobEnvironmentKeyValue("AYON_BUNDLE_NAME")
+
+    print("ayon_render_job: {0}".format(ayon_render_job))
+    print("ayon_publish_job: {0}".format(ayon_publish_job))
+    print("ayon_remote_job: {0}".format(ayon_remote_job))
+    print("ayon_has_bundle_envkey: {0}".format(ayon_has_bundle_envkey))
 
     if ayon_publish_job == "1" and ayon_render_job == "1":
         raise RuntimeError(
@@ -858,3 +1302,28 @@ def __main__(deadlinePlugin):
         inject_render_job_id(deadlinePlugin)
     if ayon_render_job == "1" or ayon_remote_job == "1":
         inject_ayon_environment(deadlinePlugin)
+
+    # If we have an ayon job but not enough environment keys
+    # specified for env injection, fall back to server url/ api key only.
+    if (
+        ayon_publish_job != "1"
+        and ayon_remote_job != "1"
+        and ayon_render_job != "1"
+        and ayon_has_bundle_envkey != ""
+    ):
+        print(">>> Setting fallback ayon credentials")
+        ayon_server_url, ayon_api_key = handle_credentials(job)
+
+        # Remove when Deadline Remote Connection Server is set up
+        api_key_path = "//blackhole/media/vfx/libs/ayonlib/deadline/api.txt"
+        if os.path.isfile(api_key_path):
+            with open(api_key_path, "r") as file:
+                ayon_api_key = file.readline().strip()
+
+        credentials = {
+            "AYON_SERVER_URL": ayon_server_url,
+            "AYON_API_KEY": ayon_api_key
+        }
+        for env, val in credentials.items():
+            job.SetJobEnvironmentKeyValue(env, val)
+
